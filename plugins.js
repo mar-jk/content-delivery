@@ -1,1459 +1,651 @@
-const cp = require('child_process');
-const {existsSync, statSync, stat, rename, readdir, remove} = require('fs-extra');
-const {relative, isAbsolute} = require('path');
-const {satisfies} = require('semver');
-
-const {
-  fs: {createTemporaryFolder, readFile, readJson, writeFile, writeJson},
-  tests: {getPackageDirectoryPath, testIf},
-} = require('pkg-tests-core');
-
-module.exports = makeTemporaryEnv => {
-  const {
-    basic: basicSpecs,
-    lock: lockSpecs,
-    script: scriptSpecs,
-    workspace: workspaceSpecs,
-  } = require('pkg-tests-specs');
-
-  describe(`Plug'n'Play`, () => {
-    basicSpecs(
-      makeTemporaryEnv.withConfig({
-        plugNPlay: true,
-      }),
-    );
-
-    lockSpecs(
-      makeTemporaryEnv.withConfig({
-        plugNPlay: true,
-      }),
-    );
-
-    scriptSpecs(
-      makeTemporaryEnv.withConfig({
-        plugNPlay: true,
-      }),
-    );
-
-    workspaceSpecs(
-      makeTemporaryEnv.withConfig({
-        plugNPlay: true,
-      }),
-    );
-
-    test(
-      `it should not use pnp when setting the override to false`,
-      makeTemporaryEnv({}, {plugNPlay: false}, async ({path, run, source}) => {
-        await run(`install`);
-
-        expect(existsSync(`${path}/.pnp.js`)).toEqual(false);
-      }),
-    );
-
-    test(
-      `it should not touch the .pnp.js file when it already exists and is up-to-date`,
-      makeTemporaryEnv(
-        {},
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          const beforeTime = (await stat(`${path}/.pnp.js`)).mtimeMs;
-
-          // Need to wait two seconds to be sure that the mtime will change
-          await new Promise(resolve => setTimeout(resolve, 2000));
-
-          await run(`install`);
-
-          const afterTime = (await stat(`${path}/.pnp.js`)).mtimeMs;
-
-          expect(afterTime).toEqual(beforeTime);
-        },
-      ),
-    );
-
-    test(
-      `it should update the .pnp.js file when it already exists but isn't up-to-date`,
-      makeTemporaryEnv(
-        {},
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          const beforeTime = (await stat(`${path}/.pnp.js`)).mtimeMs;
-
-          await writeJson(`${path}/package.json`, {
-            dependencies: {
-              [`no-deps`]: `1.0.0`,
-            },
-          });
-
-          // Need to wait two seconds to be sure that the mtime will change
-          await new Promise(resolve => setTimeout(resolve, 2000));
-
-          await run(`install`);
-
-          const afterTime = (await stat(`${path}/.pnp.js`)).mtimeMs;
-
-          expect(afterTime).not.toEqual(beforeTime);
-        },
-      ),
-    );
-
-    test(
-      `it should resolve two identical packages with the same object (easy)`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`one-fixed-dep-1`]: getPackageDirectoryPath(`one-fixed-dep`, `1.0.0`),
-            [`one-fixed-dep-2`]: getPackageDirectoryPath(`one-fixed-dep`, `1.0.0`),
-            [`no-deps`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await expect(
-            source(`require('one-fixed-dep-1').dependencies['no-deps'] === require('no-deps')`),
-          ).resolves.toEqual(true);
-          await expect(
-            source(`require('one-fixed-dep-2').dependencies['no-deps'] === require('no-deps')`),
-          ).resolves.toEqual(true);
-        },
-      ),
-    );
-
-    test(
-      `it should resolve two identical packages with the same object (complex)`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`one-fixed-dep-1`]: getPackageDirectoryPath(`one-fixed-dep`, `1.0.0`),
-            [`one-fixed-dep-2`]: getPackageDirectoryPath(`one-fixed-dep`, `1.0.0`),
-            [`no-deps`]: `2.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await expect(
-            source(
-              `require('one-fixed-dep-1').dependencies['no-deps'] === require('one-fixed-dep-2').dependencies['no-deps']`,
-            ),
-          ).resolves.toEqual(true);
-
-          await expect(
-            source(`require('one-fixed-dep-1').dependencies['no-deps'] !== require('no-deps')`),
-          ).resolves.toEqual(true);
-          await expect(
-            source(`require('one-fixed-dep-2').dependencies['no-deps'] !== require('no-deps')`),
-          ).resolves.toEqual(true);
-        },
-      ),
-    );
-
-    test(
-      `it should correctly resolve native Node modules`,
-      makeTemporaryEnv(
-        {},
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await expect(source(`require('fs') ? true : false`)).resolves.toEqual(true);
-        },
-      ),
-    );
-
-    test(
-      `it should correctly resolve relative imports`,
-      makeTemporaryEnv(
-        {},
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await writeFile(`${path}/foo.js`, `module.exports = 42;\n`);
-
-          await run(`install`);
-
-          await expect(source(`require('./foo.js')`)).resolves.toEqual(42);
-        },
-      ),
-    );
-
-    test(
-      `it should correctly resolve deep imports`,
-      makeTemporaryEnv(
-        {
-          dependencies: {[`various-requires`]: `1.0.0`},
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await expect(source(`require('various-requires/alternative-index')`)).resolves.toEqual(42);
-        },
-      ),
-    );
-
-    test(
-      `it should correctly resolve relative imports from within dependencies`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`various-requires`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await expect(source(`require('various-requires/relative-require')`)).resolves.toEqual(42);
-        },
-      ),
-    );
-
-    test(
-      `it should correctly resolve an absolute path even when the issuer doesn't exist`,
-      makeTemporaryEnv({}, {plugNPlay: true}, async ({path, run, source}) => {
-        await run(`install`);
-
-        const api = require(`${path}/.pnp.js`);
-        api.resolveToUnqualified(`${path}/.pnp.js`, `${path}/some/path/that/doesnt/exists/please/`);
-      }),
-    );
-
-    test(
-      `it should fallback to the top-level dependencies when it cannot require a transitive dependency require`,
-      makeTemporaryEnv(
-        {dependencies: {[`various-requires`]: `1.0.0`, [`no-deps`]: `1.0.0`}},
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await expect(source(`require('various-requires/invalid-require')`)).resolves.toMatchObject({
-            name: `no-deps`,
-            version: `1.0.0`,
-          });
-        },
-      ),
-    );
-
-    test(
-      `it should throw an exception if a dependency tries to require something it doesn't own`,
-      makeTemporaryEnv(
-        {dependencies: {[`various-requires`]: `1.0.0`}},
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await expect(source(`require('various-requires/invalid-require')`)).rejects.toBeTruthy();
-        },
-      ),
-    );
-
-    test(
-      `it should allow packages to require themselves`,
-      makeTemporaryEnv(
-        {
-          dependencies: {[`various-requires`]: `1.0.0`},
-        },
-        {plugNPlay: true},
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await expect(source(`require('various-requires/self') === require('various-requires')`)).resolves.toEqual(
-            true,
-          );
-        },
-      ),
-    );
-
-    test(
-      `it should not add the implicit self dependency if an explicit one already exists`,
-      makeTemporaryEnv(
-        {
-          dependencies: {[`self-require-trap`]: `1.0.0`},
-        },
-        {plugNPlay: true},
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await expect(source(`require('self-require-trap/self') !== require('self-require-trap')`)).resolves.toEqual(
-            true,
-          );
-        },
-      ),
-    );
-
-    test(
-      `it should run scripts using a Node version that auto-injects the hook`,
-      makeTemporaryEnv(
-        {
-          dependencies: {[`no-deps`]: `1.0.0`},
-          scripts: {myScript: `node -p "require('no-deps/package.json').version"`},
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run}) => {
-          await run(`install`);
-
-          await expect(run(`myScript`)).resolves.toMatchObject({
-            stdout: `1.0.0\n`,
-          });
-        },
-      ),
-    );
-
-    test(
-      `it should install in such a way that two identical packages with different peer dependencies are different instances`,
-      makeTemporaryEnv(
-        {
-          dependencies: {[`provides-peer-deps-1-0-0`]: `1.0.0`, [`provides-peer-deps-2-0-0`]: `1.0.0`},
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await expect(
-            source(`require('provides-peer-deps-1-0-0') !== require('provides-peer-deps-2-0-0')`),
-          ).resolves.toEqual(true);
-
-          await expect(source(`require('provides-peer-deps-1-0-0')`)).resolves.toMatchObject({
-            name: `provides-peer-deps-1-0-0`,
-            version: `1.0.0`,
-            dependencies: {
-              [`peer-deps`]: {
-                name: `peer-deps`,
-                version: `1.0.0`,
-                peerDependencies: {
-                  [`no-deps`]: {
-                    name: `no-deps`,
-                    version: `1.0.0`,
-                  },
-                },
-              },
-              [`no-deps`]: {
-                name: `no-deps`,
-                version: `1.0.0`,
-              },
-            },
-          });
-
-          await expect(source(`require('provides-peer-deps-2-0-0')`)).resolves.toMatchObject({
-            name: `provides-peer-deps-2-0-0`,
-            version: `1.0.0`,
-            dependencies: {
-              [`peer-deps`]: {
-                name: `peer-deps`,
-                version: `1.0.0`,
-                peerDependencies: {
-                  [`no-deps`]: {
-                    name: `no-deps`,
-                    version: `2.0.0`,
-                  },
-                },
-              },
-              [`no-deps`]: {
-                name: `no-deps`,
-                version: `2.0.0`,
-              },
-            },
-          });
-        },
-      ),
-    );
-
-    test(
-      `it should support the use case of using the result of require.resolve(...) to load a package`,
-      makeTemporaryEnv(
-        {
-          dependencies: {[`custom-dep-a`]: `file:./custom-dep-a`},
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await writeFile(
-            `${path}/custom-dep-a/index.js`,
-            `module.exports = require('custom-dep-b')(require.resolve('no-deps'))`,
-          );
-          await writeJson(`${path}/custom-dep-a/package.json`, {
-            name: `custom-dep-a`,
-            version: `1.0.0`,
-            dependencies: {[`custom-dep-b`]: `file:../custom-dep-b`, [`no-deps`]: `1.0.0`},
-          });
-
-          await writeFile(`${path}/custom-dep-b/index.js`, `module.exports = path => require(path)`);
-          await writeJson(`${path}/custom-dep-b/package.json`, {name: `custom-dep-b`, version: `1.0.0`});
-
-          await run(`install`);
-
-          await expect(source(`require('custom-dep-a')`)).resolves.toMatchObject({
-            name: `no-deps`,
-            version: `1.0.0`,
-          });
-        },
-      ),
-    );
-
-    test(
-      `it should not break the tree path when loading through the result of require.resolve(...)`,
-      makeTemporaryEnv(
-        {
-          dependencies: {[`custom-dep-a`]: `file:./custom-dep-a`},
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await writeFile(
-            `${path}/custom-dep-a/index.js`,
-            `module.exports = require('custom-dep-b')(require.resolve('custom-dep-c'))`,
-          );
-          await writeJson(`${path}/custom-dep-a/package.json`, {
-            name: `custom-dep-a`,
-            version: `1.0.0`,
-            dependencies: {[`custom-dep-b`]: `file:../custom-dep-b`, [`custom-dep-c`]: `file:../custom-dep-c`},
-          });
-
-          await writeFile(`${path}/custom-dep-b/index.js`, `module.exports = path => require(path)`);
-          await writeJson(`${path}/custom-dep-b/package.json`, {name: `custom-dep-b`, version: `1.0.0`});
-
-          await writeFile(`${path}/custom-dep-c/index.js`, `module.exports = require('no-deps')`);
-          await writeJson(`${path}/custom-dep-c/package.json`, {
-            name: `custom-dep-c`,
-            version: `1.0.0`,
-            dependencies: {[`no-deps`]: `1.0.0`},
-          });
-
-          await run(`install`);
-
-          await expect(source(`require('custom-dep-a')`)).resolves.toMatchObject({
-            name: `no-deps`,
-            version: `1.0.0`,
-          });
-        },
-      ),
-    );
-
-    if (satisfies(process.versions.node, `>=8.9.0`)) {
-      test(
-        `it should support the 'paths' option from require.resolve (same dependency tree)`,
-        makeTemporaryEnv(
-          {
-            private: true,
-            workspaces: [`workspace-*`],
-          },
-          {
-            plugNPlay: true,
-          },
-          async ({path, run, source}) => {
-            await writeJson(`${path}/workspace-a/package.json`, {
-              name: `workspace-a`,
-              version: `1.0.0`,
-              dependencies: {[`no-deps`]: `1.0.0`},
-            });
-
-            await writeJson(`${path}/workspace-b/package.json`, {
-              name: `workspace-b`,
-              version: `1.0.0`,
-              dependencies: {[`no-deps`]: `2.0.0`, [`one-fixed-dep`]: `1.0.0`},
-            });
-
-            await run(`install`);
-
-            await expect(
-              source(
-                `require(require.resolve('no-deps', {paths: ${JSON.stringify([
-                  `${path}/workspace-a`,
-                  `${path}/workspace-b`,
-                ])}}))`,
-              ),
-            ).resolves.toMatchObject({
-              name: `no-deps`,
-              version: `1.0.0`,
-            });
-          },
-        ),
-      );
-
-      // Skipped because not supported (we can't require files from within other dependency trees, since we couldn't
-      // reconcile them together: dependency tree A could think that package X has deps Y@1 while dependency tree B
-      // could think that X has deps Y@2 instead. Since they would share the same location on the disk, PnP wouldn't
-      // be able to tell which one should be used)
-      test.skip(
-        `it should support the 'paths' option from require.resolve (different dependency trees)`,
-        makeTemporaryEnv(
-          {
-            dependencies: {},
-          },
-          {
-            plugNPlay: true,
-          },
-          async ({path, run, source}) => {
-            await run(`install`);
-
-            const tmpA = await createTemporaryFolder();
-            const tmpB = await createTemporaryFolder();
-
-            await writeJson(`${tmpA}/package.json`, {
-              dependencies: {[`no-deps`]: `1.0.0`},
-            });
-
-            await writeJson(`${tmpB}/package.json`, {
-              dependencies: {[`no-deps`]: `2.0.0`, [`one-fixed-dep`]: `1.0.0`},
-            });
-
-            await run(`install`, {
-              cwd: tmpA,
-            });
-
-            await run(`install`, {
-              cwd: tmpB,
-            });
-
-            await expect(
-              source(`require(require.resolve('no-deps', {paths: ${JSON.stringify([tmpA, tmpB])}}))`),
-            ).resolves.toMatchObject({
-              name: `no-deps`,
-              version: `1.0.0`,
-            });
-          },
-        ),
-      );
-
-      test(
-        `using require.resolve with unsupported options should throw`,
-        makeTemporaryEnv(
-          {
-            dependencies: {[`no-deps`]: `1.0.0`},
-          },
-          {
-            plugNPlay: true,
-          },
-          async ({path, run, source}) => {
-            await run(`install`);
-
-            await expect(source(`require.resolve('no-deps', {foobar: 42})`)).rejects.toBeTruthy();
-          },
-        ),
-      );
+/* @flow */
+
+import type {Manifest, DependencyRequestPatterns, DependencyRequestPattern} from './types.js';
+import type {RegistryNames} from './registries/index.js';
+import type PackageReference from './package-reference.js';
+import type {Reporter} from './reporters/index.js';
+import {getExoticResolver} from './resolvers/index.js';
+import type Config from './config.js';
+import PackageRequest from './package-request.js';
+import {normalizePattern} from './util/normalize-pattern.js';
+import RequestManager from './util/request-manager.js';
+import BlockingQueue from './util/blocking-queue.js';
+import Lockfile, {type LockManifest} from './lockfile';
+import map from './util/map.js';
+import WorkspaceLayout from './workspace-layout.js';
+import ResolutionMap, {shouldUpdateLockfile} from './resolution-map.js';
+
+const invariant = require('invariant');
+const semver = require('semver');
+
+export type ResolverOptions = {|
+  isFlat?: boolean,
+  isFrozen?: boolean,
+  workspaceLayout?: WorkspaceLayout,
+|};
+
+export default class PackageResolver {
+  constructor(config: Config, lockfile: Lockfile, resolutionMap: ResolutionMap = new ResolutionMap(config)) {
+    this.patternsByPackage = map();
+    this.fetchingPatterns = new Set();
+    this.fetchingQueue = new BlockingQueue('resolver fetching');
+    this.patterns = map();
+    this.resolutionMap = resolutionMap;
+    this.usedRegistries = new Set();
+    this.flat = false;
+
+    this.reporter = config.reporter;
+    this.lockfile = lockfile;
+    this.config = config;
+    this.delayedResolveQueue = [];
+  }
+
+  // whether the dependency graph will be flattened
+  flat: boolean;
+
+  frozen: boolean;
+
+  workspaceLayout: ?WorkspaceLayout;
+
+  resolutionMap: ResolutionMap;
+
+  // list of registries that have been used in this resolution
+  usedRegistries: Set<RegistryNames>;
+
+  // activity monitor
+  activity: ?{
+    tick: (name: string) => void,
+    end: () => void,
+  };
+
+  // patterns we've already resolved or are in the process of resolving
+  fetchingPatterns: Set<string>;
+
+  // TODO
+  fetchingQueue: BlockingQueue;
+
+  // manages and throttles json api http requests
+  requestManager: RequestManager;
+
+  // list of patterns associated with a package
+  patternsByPackage: {
+    [packageName: string]: Array<string>,
+  };
+
+  // lockfile instance which we can use to retrieve version info
+  lockfile: Lockfile;
+
+  // a map of dependency patterns to packages
+  patterns: {
+    [packagePattern: string]: Manifest,
+  };
+
+  // reporter instance, abstracts out display logic
+  reporter: Reporter;
+
+  // environment specific config methods and options
+  config: Config;
+
+  // list of packages need to be resolved later (they found a matching version in the
+  // resolver, but better matches can still arrive later in the resolve process)
+  delayedResolveQueue: Array<{req: PackageRequest, info: Manifest}>;
+
+  /**
+   * TODO description
+   */
+
+  isNewPattern(pattern: string): boolean {
+    return !!this.patterns[pattern].fresh;
+  }
+
+  updateManifest(ref: PackageReference, newPkg: Manifest): Promise<void> {
+    // inherit fields
+    const oldPkg = this.patterns[ref.patterns[0]];
+    newPkg._reference = ref;
+    newPkg._remote = ref.remote;
+    newPkg.name = oldPkg.name;
+    newPkg.fresh = oldPkg.fresh;
+    newPkg.prebuiltVariants = oldPkg.prebuiltVariants;
+
+    // update patterns
+    for (const pattern of ref.patterns) {
+      this.patterns[pattern] = newPkg;
     }
 
-    test(
-      `it should load the index.js file when loading from a folder`,
-      makeTemporaryEnv({}, {plugNPlay: true}, async ({path, run, source}) => {
-        await run(`install`);
+    return Promise.resolve();
+  }
 
-        const tmp = await createTemporaryFolder();
+  updateManifests(newPkgs: Array<Manifest>): Promise<void> {
+    for (const newPkg of newPkgs) {
+      if (newPkg._reference) {
+        for (const pattern of newPkg._reference.patterns) {
+          const oldPkg = this.patterns[pattern];
+          newPkg.prebuiltVariants = oldPkg.prebuiltVariants;
 
-        await writeFile(`${tmp}/folder/index.js`, `module.exports = 42;`);
+          this.patterns[pattern] = newPkg;
+        }
+      }
+    }
 
-        await expect(source(`require(${JSON.stringify(tmp)} + "/folder")`)).resolves.toEqual(42);
-      }),
+    return Promise.resolve();
+  }
+
+  /**
+   * Given a list of patterns, dedupe them to a list of unique patterns.
+   */
+
+  dedupePatterns(patterns: Iterable<string>): Array<string> {
+    const deduped = [];
+    const seen = new Set();
+
+    for (const pattern of patterns) {
+      const info = this.getResolvedPattern(pattern);
+      if (seen.has(info)) {
+        continue;
+      }
+
+      seen.add(info);
+      deduped.push(pattern);
+    }
+
+    return deduped;
+  }
+
+  /**
+   * Get a list of all manifests by topological order.
+   */
+
+  getTopologicalManifests(seedPatterns: Array<string>): Iterable<Manifest> {
+    const pkgs: Set<Manifest> = new Set();
+    const skip: Set<Manifest> = new Set();
+
+    const add = (seedPatterns: Array<string>) => {
+      for (const pattern of seedPatterns) {
+        const pkg = this.getStrictResolvedPattern(pattern);
+        if (skip.has(pkg)) {
+          continue;
+        }
+
+        const ref = pkg._reference;
+        invariant(ref, 'expected reference');
+        skip.add(pkg);
+        add(ref.dependencies);
+        pkgs.add(pkg);
+      }
+    };
+
+    add(seedPatterns);
+
+    return pkgs;
+  }
+
+  /**
+   * Get a list of all manifests by level sort order.
+   */
+
+  getLevelOrderManifests(seedPatterns: Array<string>): Iterable<Manifest> {
+    const pkgs: Set<Manifest> = new Set();
+    const skip: Set<Manifest> = new Set();
+
+    const add = (seedPatterns: Array<string>) => {
+      const refs = [];
+
+      for (const pattern of seedPatterns) {
+        const pkg = this.getStrictResolvedPattern(pattern);
+        if (skip.has(pkg)) {
+          continue;
+        }
+
+        const ref = pkg._reference;
+        invariant(ref, 'expected reference');
+
+        refs.push(ref);
+        skip.add(pkg);
+        pkgs.add(pkg);
+      }
+
+      for (const ref of refs) {
+        add(ref.dependencies);
+      }
+    };
+
+    add(seedPatterns);
+
+    return pkgs;
+  }
+
+  /**
+   * Get a list of all package names in the dependency graph.
+   */
+
+  getAllDependencyNamesByLevelOrder(seedPatterns: Array<string>): Iterable<string> {
+    const names = new Set();
+    for (const {name} of this.getLevelOrderManifests(seedPatterns)) {
+      names.add(name);
+    }
+    return names;
+  }
+
+  /**
+   * Retrieve all the package info stored for this package name.
+   */
+
+  getAllInfoForPackageName(name: string): Array<Manifest> {
+    const patterns = this.patternsByPackage[name] || [];
+    return this.getAllInfoForPatterns(patterns);
+  }
+
+  /**
+   * Retrieve all the package info stored for a list of patterns.
+   */
+
+  getAllInfoForPatterns(patterns: string[]): Array<Manifest> {
+    const infos = [];
+    const seen = new Set();
+
+    for (const pattern of patterns) {
+      const info = this.patterns[pattern];
+      if (seen.has(info)) {
+        continue;
+      }
+
+      seen.add(info);
+      infos.push(info);
+    }
+
+    return infos;
+  }
+
+  /**
+   * Get a flat list of all package info.
+   */
+
+  getManifests(): Array<Manifest> {
+    const infos = [];
+    const seen = new Set();
+
+    for (const pattern in this.patterns) {
+      const info = this.patterns[pattern];
+      if (seen.has(info)) {
+        continue;
+      }
+
+      infos.push(info);
+      seen.add(info);
+    }
+
+    return infos;
+  }
+
+  /**
+   * replace pattern in resolver, e.g. `name` is replaced with `name@^1.0.1`
+   */
+  replacePattern(pattern: string, newPattern: string) {
+    const pkg = this.getResolvedPattern(pattern);
+    invariant(pkg, `missing package ${pattern}`);
+    const ref = pkg._reference;
+    invariant(ref, 'expected package reference');
+    ref.patterns = [newPattern];
+    this.addPattern(newPattern, pkg);
+    this.removePattern(pattern);
+  }
+
+  /**
+   * Make all versions of this package resolve to it.
+   */
+
+  collapseAllVersionsOfPackage(name: string, version: string): string {
+    const patterns = this.dedupePatterns(this.patternsByPackage[name]);
+    return this.collapsePackageVersions(name, version, patterns);
+  }
+
+  /**
+   * Make all given patterns resolve to version.
+   */
+  collapsePackageVersions(name: string, version: string, patterns: string[]): string {
+    const human = `${name}@${version}`;
+
+    // get manifest that matches the version we're collapsing too
+    let collapseToReference: ?PackageReference;
+    let collapseToManifest: Manifest;
+    let collapseToPattern: string;
+    for (const pattern of patterns) {
+      const _manifest = this.patterns[pattern];
+      if (_manifest.version === version) {
+        collapseToReference = _manifest._reference;
+        collapseToManifest = _manifest;
+        collapseToPattern = pattern;
+        break;
+      }
+    }
+
+    invariant(
+      collapseToReference && collapseToManifest && collapseToPattern,
+      `Couldn't find package manifest for ${human}`,
     );
 
-    test(
-      `it should resolve the .js extension`,
-      makeTemporaryEnv({}, {plugNPlay: true}, async ({path, run, source}) => {
-        await run(`install`);
+    for (const pattern of patterns) {
+      // don't touch the pattern we're collapsing to
+      if (pattern === collapseToPattern) {
+        continue;
+      }
 
-        const tmp = await createTemporaryFolder();
+      // remove this pattern
+      const ref = this.getStrictResolvedPattern(pattern)._reference;
+      invariant(ref, 'expected package reference');
+      const refPatterns = ref.patterns.slice();
+      ref.prune();
 
-        await writeFile(`${tmp}/file.js`, `module.exports = 42;`);
+      // add pattern to the manifest we're collapsing to
+      for (const pattern of refPatterns) {
+        collapseToReference.addPattern(pattern, collapseToManifest);
+      }
+    }
 
-        await expect(source(`require(${JSON.stringify(tmp)} + "/file")`)).resolves.toEqual(42);
-      }),
+    return collapseToPattern;
+  }
+
+  /**
+   * TODO description
+   */
+
+  addPattern(pattern: string, info: Manifest) {
+    this.patterns[pattern] = info;
+
+    const byName = (this.patternsByPackage[info.name] = this.patternsByPackage[info.name] || []);
+    if (byName.indexOf(pattern) === -1) {
+      byName.push(pattern);
+    }
+  }
+
+  /**
+   * TODO description
+   */
+
+  removePattern(pattern: string) {
+    const pkg = this.patterns[pattern];
+    if (!pkg) {
+      return;
+    }
+
+    const byName = this.patternsByPackage[pkg.name];
+    if (!byName) {
+      return;
+    }
+
+    byName.splice(byName.indexOf(pattern), 1);
+    delete this.patterns[pattern];
+  }
+
+  /**
+   * TODO description
+   */
+
+  getResolvedPattern(pattern: string): ?Manifest {
+    return this.patterns[pattern];
+  }
+
+  /**
+   * TODO description
+   */
+
+  getStrictResolvedPattern(pattern: string): Manifest {
+    const manifest = this.getResolvedPattern(pattern);
+    invariant(manifest, 'expected manifest');
+    return manifest;
+  }
+
+  /**
+   * TODO description
+   */
+
+  getExactVersionMatch(name: string, version: string, manifest: ?Manifest): ?Manifest {
+    const patterns = this.patternsByPackage[name];
+    if (!patterns) {
+      return null;
+    }
+
+    for (const pattern of patterns) {
+      const info = this.getStrictResolvedPattern(pattern);
+      if (info.version === version) {
+        return info;
+      }
+    }
+
+    if (manifest && getExoticResolver(version)) {
+      return this.exoticRangeMatch(patterns.map(this.getStrictResolvedPattern.bind(this)), manifest);
+    }
+
+    return null;
+  }
+
+  /**
+   * Get the manifest of the highest known version that satisfies a package range
+   */
+
+  getHighestRangeVersionMatch(name: string, range: string, manifest: ?Manifest): ?Manifest {
+    const patterns = this.patternsByPackage[name];
+
+    if (!patterns) {
+      return null;
+    }
+
+    const versionNumbers = [];
+    const resolvedPatterns = patterns.map((pattern): Manifest => {
+      const info = this.getStrictResolvedPattern(pattern);
+      versionNumbers.push(info.version);
+
+      return info;
+    });
+
+    const maxValidRange = semver.maxSatisfying(versionNumbers, range);
+
+    if (!maxValidRange) {
+      return manifest && getExoticResolver(range) ? this.exoticRangeMatch(resolvedPatterns, manifest) : null;
+    }
+
+    const indexOfmaxValidRange = versionNumbers.indexOf(maxValidRange);
+    const maxValidRangeManifest = resolvedPatterns[indexOfmaxValidRange];
+
+    return maxValidRangeManifest;
+  }
+
+  /**
+   * Get the manifest of the package that matches an exotic range
+   */
+
+  exoticRangeMatch(resolvedPkgs: Array<Manifest>, manifest: Manifest): ?Manifest {
+    const remote = manifest._remote;
+    if (!(remote && remote.reference && remote.type === 'copy')) {
+      return null;
+    }
+
+    const matchedPkg = resolvedPkgs.find(
+      ({_remote: pkgRemote}) => pkgRemote && pkgRemote.reference === remote.reference && pkgRemote.type === 'copy',
     );
 
-    test(
-      `it should ignore the "main" entry if it doesn't resolve`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`invalid-main`]: `1.0.0`,
-          },
-        },
-        {plugNPlay: true},
-        async ({path, run, source}) => {
-          await run(`install`);
+    if (matchedPkg) {
+      manifest._remote = matchedPkg._remote;
+    }
 
-          await expect(source(`require("invalid-main")`)).resolves.toMatchObject({
-            name: `invalid-main`,
-            version: `1.0.0`,
-          });
-        },
-      ),
+    return matchedPkg;
+  }
+
+  /**
+   * Determine if LockfileEntry is incorrect, remove it from lockfile cache and consider the pattern as new
+   */
+  isLockfileEntryOutdated(version: string, range: string, hasVersion: boolean): boolean {
+    return !!(
+      semver.validRange(range) &&
+      semver.valid(version) &&
+      !getExoticResolver(range) &&
+      hasVersion &&
+      !semver.satisfies(version, range)
     );
-
-    test(
-      `it should use the regular Node resolution when requiring files outside of the pnp install tree`,
-      makeTemporaryEnv({}, {plugNPlay: true}, async ({path, run, source}) => {
-        await run(`install`);
-
-        const tmp = await createTemporaryFolder();
-
-        await writeFile(`${tmp}/node_modules/dep/index.js`, `module.exports = 42;`);
-        await writeFile(`${tmp}/index.js`, `require('dep')`);
-
-        await source(`require(${JSON.stringify(tmp)} + "/index.js")`);
-      }),
-    );
-
-    test(
-      `it should allow scripts outside of the dependency tree to require files within the dependency tree`,
-      makeTemporaryEnv(
-        {dependencies: {[`no-deps`]: `1.0.0`}},
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          const tmp = await createTemporaryFolder();
-
-          await writeFile(`${tmp}/index.js`, `require(process.argv[2])`);
-          await writeFile(`${path}/index.js`, `require('no-deps')`);
-
-          await run(`node`, `${tmp}/index.js`, `${path}/index.js`);
-        },
-      ),
-    );
-
-    test(
-      `it should export the PnP API through the 'pnpapi' name`,
-      makeTemporaryEnv(
-        {},
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await expect(source(`typeof require('pnpapi').VERSIONS.std`)).resolves.toEqual(`number`);
-        },
-      ),
-    );
-
-    test(
-      `it should expose the PnP version through 'process.versions.pnp'`,
-      makeTemporaryEnv({}, {plugNPlay: true}, async ({path, run, source}) => {
-        await run(`install`);
-
-        const pnpapiVersionsStd = await source(`require('pnpapi').VERSIONS.std`);
-        const processVersionsPnp = await source(`process.versions.pnp`);
-
-        await expect(typeof processVersionsPnp).toEqual(`string`);
-        await expect(processVersionsPnp).toEqual(String(pnpapiVersionsStd));
-      }),
-    );
-
-    test(
-      `it should not update the installConfig.pnp field of the package.json when installing with an environment override`,
-      makeTemporaryEnv(
-        {},
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await expect(readJson(`${path}/package.json`)).resolves.not.toMatchObject({
-            installConfig: {pnp: true},
-          });
-        },
-      ),
-    );
-
-    test(
-      `it should update the installConfig.pnp field of the package.json when installing with --enable-pnp`,
-      makeTemporaryEnv({}, async ({path, run, source}) => {
-        await run(`install`, `--enable-pnp`);
-
-        await expect(readJson(`${path}/package.json`)).resolves.toMatchObject({
-          installConfig: {pnp: true},
-        });
-      }),
-    );
-
-    test(
-      `it should install dependencies using pnp when the installConfig.pnp field is set to true`,
-      makeTemporaryEnv(
-        {
-          dependencies: {[`no-deps`]: `1.0.0`},
-          installConfig: {pnp: true},
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          expect(existsSync(`${path}/.pnp.js`)).toEqual(true);
-        },
-      ),
-    );
-
-    test(
-      `it should update the installConfig.pnp field of the package.json when installing with --disable-pnp`,
-      makeTemporaryEnv(
-        {
-          installConfig: {pnp: true},
-        },
-        async ({path, run, source}) => {
-          await run(`install`, `--disable-pnp`);
-
-          await expect(readJson(`${path}/package.json`)).resolves.not.toHaveProperty('installConfig.pnp');
-        },
-      ),
-    );
-
-    test(
-      `it should not remove other fields than installConfig.pnp when using --disable-pnp`,
-      makeTemporaryEnv(
-        {
-          installConfig: {pnp: true, foo: true},
-        },
-        async ({path, run, source}) => {
-          await run(`install`, `--disable-pnp`);
-
-          await expect(readJson(`${path}/package.json`)).resolves.toHaveProperty('installConfig.foo', true);
-        },
-      ),
-    );
-
-    testIf(
-      () => process.platform !== 'win32',
-      `it should generate a file that can be used as an executable to resolve a request (valid request)`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          expect(statSync(`${path}/.pnp.js`).mode & 0o111).toEqual(0o111);
-
-          const result = JSON.parse(cp.execFileSync(`${path}/.pnp.js`, [`no-deps`, `${path}/`], {encoding: `utf-8`}));
-
-          expect(result[0]).toEqual(null);
-          expect(typeof result[1]).toEqual(`string`);
-
-          expect(require(result[1])).toMatchObject({
-            name: `no-deps`,
-            version: `1.0.0`,
-          });
-        },
-      ),
-    );
-
-    testIf(
-      () => process.platform !== `win32`,
-      `it should generate a file that can be used as an executable to resolve a request (builtin request)`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          expect(statSync(`${path}/.pnp.js`).mode & 0o111).toEqual(0o111);
-
-          const result = JSON.parse(cp.execFileSync(`${path}/.pnp.js`, [`fs`, `${path}/`], {encoding: `utf-8`}));
-
-          expect(result[0]).toEqual(null);
-          expect(result[1]).toEqual(null);
-        },
-      ),
-    );
-
-    testIf(
-      () => process.platform !== `win32`,
-      `it should generate a file that can be used as an executable to resolve a request (invalid request)`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          expect(statSync(`${path}/.pnp.js`).mode & 0o111).toEqual(0o111);
-
-          const result = JSON.parse(
-            cp.execFileSync(`${path}/.pnp.js`, [`doesnt-exists`, `${path}/`], {encoding: `utf-8`}),
-          );
-
-          expect(typeof result[0].code).toEqual(`string`);
-          expect(typeof result[0].message).toEqual(`string`);
-
-          expect(result[1]).toEqual(null);
-        },
-      ),
-    );
-
-    test(
-      `it should generate a file with a custom shebang if configured as such`,
-      makeTemporaryEnv(
-        {},
-        {
-          plugNPlay: true,
-          plugnplayShebang: `foo`,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          expect(await readFile(`${path}/.pnp.js`, `utf-8`)).toMatch(/^#!foo\n/);
-        },
-      ),
-    );
-
-    it(
-      `it should not be enabled for paths matching the specified regex`,
-      makeTemporaryEnv(
-        {},
-        {
-          plugNPlay: true,
-          plugnplayBlacklist: `/foo/`,
-        },
-        async ({path, run, source}) => {
-          await writeFile(`${path}/foo/shouldwork.js`, `module.exports = require('bad-dep');\n`);
-          await writeFile(`${path}/doesntwork.js`, `module.exports = require('bad-dep');\n`);
-
-          await run(`install`);
-
-          // Force it to exist so that the two scripts would succeed if using the node resolution
-          await writeFile(`${path}/node_modules/bad-dep/index.js`, `module.exports = 42;\n`);
-
-          await expect(source(`require('./doesntwork')`)).rejects.toBeTruthy();
-          await expect(source(`require('./foo/shouldwork')`)).resolves.toBeTruthy();
-        },
-      ),
-    );
-
-    it(
-      `it should not break relative requires for files within a blacklist`,
-      makeTemporaryEnv(
-        {},
-        {
-          plugNPlay: true,
-          plugnplayBlacklist: `/foo/`,
-        },
-        async ({path, run, source}) => {
-          await writeFile(`${path}/foo/filea.js`, `module.exports = require('./fileb');\n`);
-          await writeFile(`${path}/foo/fileb.js`, `module.exports = 42;\n`);
-
-          await run(`install`);
-
-          await expect(source(`require('./foo/filea')`)).resolves.toEqual(42);
-        },
-      ),
-    );
-
-    test(
-      `it should install the packages within a node_modules directory (even if within the cache)`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          // This is to allow a maximal compatibility with packages that expect to
-          // be located inside a node_modules directory. Various tools (such as
-          // transpilers) also use regexps in their configuration that it would be
-          // nice not to break.
-
-          await run(`install`);
-
-          expect(await source(`require.resolve('no-deps')`)).toMatch(/[\\\/]node_modules[\\\/]no-deps[\\\/]/);
-        },
-      ),
-    );
-
-    test(
-      `it should install packages with peer dependencies within a node_modules directory (even if within the .pnp folder)`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`peer-deps`]: `1.0.0`,
-            [`no-deps`]: `2.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          // This is to allow a maximal compatibility with packages that expect to
-          // be located inside a node_modules directory. Various tools (such as
-          // transpilers) also use regexps in their configuration that it would be
-          // nice not to break.
-
-          await run(`install`);
-
-          expect(await source(`require.resolve('peer-deps')`)).toMatch(/[\\\/]node_modules[\\\/]peer-deps[\\\/]/);
-        },
-      ),
-    );
-
-    test(
-      `it should make it possible to copy the pnp file and cache from one place to another`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await makeTemporaryEnv(
-            {
-              [`no-deps`]: `1.0.0`,
-            },
-            {
-              plugNPlay: true,
-            },
-            async ({path: path2, run: run2, source: source2}) => {
-              // Move the install artifacts into a new location
-              // If the .pnp.js file references absolute paths, they will stop working
-              await rename(`${path}/.cache`, `${path2}/.cache`);
-              await rename(`${path}/.pnp.js`, `${path2}/.pnp.js`);
-
-              await expect(source2(`require('no-deps')`)).resolves.toMatchObject({
-                name: `no-deps`,
-                version: `1.0.0`,
-              });
-            },
-          )();
-        },
-      ),
-    );
-
-    test(
-      `it should generate the same hooks for two projects with the same configuration`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await makeTemporaryEnv(
-            {
-              dependencies: {
-                [`no-deps`]: `1.0.0`,
-              },
-            },
-            {
-              plugNPlay: true,
-            },
-            async ({path: path2, run: run2, source: source2}) => {
-              expect(path2).not.toEqual(path);
-
-              await run2(`install`);
-
-              expect(readFile(`${path2}/.pnp.js`, 'utf8')).resolves.toEqual(await readFile(`${path}/.pnp.js`, 'utf8'));
-            },
-          )();
-        },
-      ),
-    );
-
-    test(
-      `it should allow unplugging packages from a pnp installation`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `1.0.0`,
-            [`various-requires`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-          await run(`unplug`, `various-requires`);
-
-          const listing = await readdir(`${path}/.pnp/unplugged`);
-          expect(listing).toHaveLength(1);
-
-          await writeFile(
-            `${path}/.pnp/unplugged/${listing[0]}/node_modules/various-requires/alternative-index.js`,
-            `module.exports = "unplugged";\n`,
-          );
-
-          await expect(source(`require('various-requires/relative-require')`)).resolves.toMatch('unplugged');
-          await expect(source(`require('no-deps/package.json')`)).resolves.toMatchObject({
-            name: `no-deps`,
-            version: `1.0.0`,
-          });
-        },
-      ),
-    );
-
-    test(
-      `it should allow unplugging packages from a still uninstalled pnp installation`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `1.0.0`,
-            [`various-requires`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`unplug`, `various-requires`);
-
-          const listing = await readdir(`${path}/.pnp/unplugged`);
-          expect(listing).toHaveLength(1);
-
-          await writeFile(
-            `${path}/.pnp/unplugged/${listing[0]}/node_modules/various-requires/alternative-index.js`,
-            `module.exports = "unplugged";\n`,
-          );
-
-          await expect(source(`require('various-requires/relative-require')`)).resolves.toMatch('unplugged');
-          await expect(source(`require('no-deps/package.json')`)).resolves.toMatchObject({
-            name: `no-deps`,
-            version: `1.0.0`,
-          });
-        },
-      ),
-    );
-
-    test(
-      `it should produce an error if unplugging with pnp disabled`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `1.0.0`,
-            [`various-requires`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: false,
-        },
-        async ({path, run, source}) => {
-          await expect(run(`unplug`, `various-requires`)).rejects.toBeTruthy();
-        },
-      ),
-    );
-
-    test(
-      `it should allow unplugging multiple (deep) packages from a pnp installation`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `2.0.0`,
-            [`one-fixed-dep`]: `1.0.0`,
-            [`various-requires`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-          await run(`unplug`, `various-requires`, `no-deps`);
-
-          await expect(readdir(`${path}/.pnp/unplugged`)).resolves.toHaveLength(3);
-        },
-      ),
-    );
-
-    test(
-      'it should allow unplugging package (semver) ranges from a pnp installation',
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `2.0.0`,
-            [`one-fixed-dep`]: `1.0.0`,
-            [`various-requires`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-          await run(`unplug`, `various-requires`, `no-deps@^1.0.0`);
-
-          await expect(readdir(`${path}/.pnp/unplugged`)).resolves.toHaveLength(2);
-        },
-      ),
-    );
-
-    test(
-      'it should properly unplug a package with peer dependencies',
-      makeTemporaryEnv(
-        {
-          dependencies: {[`provides-peer-deps-1-0-0`]: `1.0.0`, [`provides-peer-deps-2-0-0`]: `1.0.0`},
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`unplug`, `no-deps`, `peer-deps`);
-
-          await expect(
-            source(`require('provides-peer-deps-1-0-0') !== require('provides-peer-deps-2-0-0')`),
-          ).resolves.toEqual(true);
-
-          await expect(source(`require('provides-peer-deps-1-0-0')`)).resolves.toMatchObject({
-            name: `provides-peer-deps-1-0-0`,
-            version: `1.0.0`,
-            dependencies: {
-              [`peer-deps`]: {
-                name: `peer-deps`,
-                version: `1.0.0`,
-                peerDependencies: {
-                  [`no-deps`]: {
-                    name: `no-deps`,
-                    version: `1.0.0`,
-                  },
-                },
-              },
-              [`no-deps`]: {
-                name: `no-deps`,
-                version: `1.0.0`,
-              },
-            },
-          });
-
-          await expect(source(`require('provides-peer-deps-2-0-0')`)).resolves.toMatchObject({
-            name: `provides-peer-deps-2-0-0`,
-            version: `1.0.0`,
-            dependencies: {
-              [`peer-deps`]: {
-                name: `peer-deps`,
-                version: `1.0.0`,
-                peerDependencies: {
-                  [`no-deps`]: {
-                    name: `no-deps`,
-                    version: `2.0.0`,
-                  },
-                },
-              },
-              [`no-deps`]: {
-                name: `no-deps`,
-                version: `2.0.0`,
-              },
-            },
-          });
-        },
-      ),
-    );
-
-    test(
-      `it shouldn't clear the unplugged folder when running an install`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `1.0.0`,
-            [`various-requires`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`unplug`, `various-requires`);
-          await run(`install`);
-
-          await expect(readdir(`${path}/.pnp/unplugged`)).resolves.toHaveLength(1);
-        },
-      ),
-    );
-
-    test(
-      `it shouldn't clear the unplugged folder when unplugging new packages`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `1.0.0`,
-            [`various-requires`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`unplug`, `various-requires`);
-          await run(`unplug`, `no-deps`);
-
-          await expect(readdir(`${path}/.pnp/unplugged`)).resolves.toHaveLength(2);
-        },
-      ),
-    );
-
-    test(
-      `it should clear the specified packages when using --clear`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `1.0.0`,
-            [`various-requires`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`unplug`, `various-requires`);
-
-          await expect(readdir(`${path}/.pnp/unplugged`)).resolves.toHaveLength(1);
-
-          await run(`unplug`, `various-requires`, `--clear`);
-
-          expect(existsSync(`${path}/.pnp/unplugged`)).toEqual(false);
-        },
-      ),
-    );
-
-    test(
-      `it should clear the whole unplugged folder when using unplug --clear-all`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `1.0.0`,
-            [`various-requires`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`unplug`, `various-requires`);
-          await run(`unplug`, `--clear-all`);
-
-          expect(existsSync(`${path}/.pnp/unplugged`)).toEqual(false);
-        },
-      ),
-    );
-
-    test(
-      `it should not override an already unplugged package`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`no-deps`]: `1.0.0`,
-            [`various-requires`]: `1.0.0`,
-          },
-        },
-        {
-          plugNPlay: true,
-        },
-        async ({path, run, source}) => {
-          await run(`install`);
-          await run(`unplug`, `various-requires`);
-
-          const listing = await readdir(`${path}/.pnp/unplugged`);
-          expect(listing).toHaveLength(1);
-
-          await writeFile(
-            `${path}/.pnp/unplugged/${listing[0]}/node_modules/various-requires/alternative-index.js`,
-            `module.exports = "unplugged";\n`,
-          );
-
-          await run(`unplug`, `various-requires`, `no-deps`);
-
-          await expect(source(`require('various-requires/relative-require')`)).resolves.toMatch('unplugged');
-          await expect(source(`require('no-deps/package.json')`)).resolves.toMatchObject({
-            name: `no-deps`,
-            version: `1.0.0`,
-          });
-        },
-      ),
-    );
-
-    test(
-      `it should automatically unplug packages with postinstall scripts`,
-      makeTemporaryEnv(
-        {
-          dependencies: {[`no-deps-scripted`]: `1.0.0`},
-        },
-        {plugNPlay: true},
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          const resolution = await source(`require.resolve('no-deps-scripted')`);
-          const cacheRelativeResolution = relative(`${path}/.cache`, resolution);
-
-          expect(
-            cacheRelativeResolution &&
-              !cacheRelativeResolution.startsWith(`..${path.sep}`) &&
-              !isAbsolute(cacheRelativeResolution),
-          );
-        },
-      ),
-    );
-
-    test(
-      `it should not cache the postinstall artifacts`,
-      makeTemporaryEnv(
-        {
-          dependencies: {[`no-deps-scripted`]: `1.0.0`},
-        },
-        {plugNPlay: true},
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          const rndBefore = await source(`require('no-deps-scripted/rnd.js')`);
-
-          await remove(`${path}/.pnp`);
-          await remove(`${path}/.pnp.js`);
-
-          await run(`install`);
-
-          const rndAfter = await source(`require('no-deps-scripted/rnd.js')`);
-
-          // It might fail once every blue moon, when the two random numbers are equal
-          expect(rndAfter).not.toEqual(rndBefore);
-        },
-      ),
-    );
-
-    test(
-      `it should not break spawning new Node processes ('node' command)`,
-      makeTemporaryEnv(
-        {
-          dependencies: {[`no-deps`]: `1.0.0`},
-        },
-        {plugNPlay: true},
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await writeFile(`${path}/script.js`, `console.log(JSON.stringify(require('no-deps')))`);
-
-          await expect(
-            source(
-              `JSON.parse(require('child_process').execFileSync(process.execPath, [${JSON.stringify(
-                `${path}/script.js`,
-              )}]).toString())`,
-            ),
-          ).resolves.toMatchObject({
-            name: `no-deps`,
-            version: `1.0.0`,
-          });
-        },
-      ),
-    );
-
-    test(
-      `it should not break spawning new Node processes ('run' command)`,
-      makeTemporaryEnv(
-        {
-          dependencies: {[`no-deps`]: `1.0.0`},
-          scripts: {[`script`]: `node main.js`},
-        },
-        {plugNPlay: true},
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await writeFile(`${path}/sub.js`, `console.log(JSON.stringify(require('no-deps')))`);
-          await writeFile(
-            `${path}/main.js`,
-            `console.log(require('child_process').execFileSync(process.execPath, [${JSON.stringify(
-              `${path}/sub.js`,
-            )}]).toString())`,
-          );
-
-          expect(JSON.parse((await run(`run`, `script`)).stdout)).toMatchObject({
-            name: `no-deps`,
-            version: `1.0.0`,
-          });
-        },
-      ),
-    );
-
-    test(
-      `it should properly forward the NODE_OPTIONS environment variable`,
-      makeTemporaryEnv({}, {plugNPlay: true}, async ({path, run, source}) => {
-        await run(`install`);
-
-        await writeFile(`${path}/foo.js`, `console.log(42);`);
-
-        await expect(
-          run(`node`, `-e`, `console.log(21);`, {env: {NODE_OPTIONS: `--require ${path}/foo`}}),
-        ).resolves.toMatchObject({
-          // Note that '42' is present twice: the first one because Node executes Yarn, and the second one because Yarn spawns Node
-          stdout: `42\n42\n21\n`,
-        });
-      }),
-    );
-
-    test(
-      `it should transparently support the "resolve" package`,
-      makeTemporaryEnv(
-        {
-          dependencies: {
-            [`resolve`]: `https://github.com/browserify/resolve.git`,
-          },
-          resolutions: {
-            [`path-parse`]: `https://registry.yarnpkg.com/path-parse/-/path-parse-1.0.6.tgz`,
-          },
-        },
-        {plugNPlay: true},
-        async ({path, run, source}) => {
-          await run(`install`);
-
-          await expect(source(`require('resolve').sync('resolve')`)).resolves.toEqual(
-            await source(`require.resolve('resolve')`),
-          );
-        },
-      ),
-      15000,
-    );
-  });
-};
+  }
+
+  /**
+   * TODO description
+   */
+
+  async find(initialReq: DependencyRequestPattern): Promise<void> {
+    const req = this.resolveToResolution(initialReq);
+
+    // we've already resolved it with a resolution
+    if (!req) {
+      return;
+    }
+
+    const request = new PackageRequest(req, this);
+    const fetchKey = `${req.registry}:${req.pattern}:${String(req.optional)}`;
+    const initialFetch = !this.fetchingPatterns.has(fetchKey);
+    let fresh = false;
+
+    if (this.activity) {
+      this.activity.tick(req.pattern);
+    }
+
+    if (initialFetch) {
+      this.fetchingPatterns.add(fetchKey);
+
+      const lockfileEntry = this.lockfile.getLocked(req.pattern);
+
+      if (lockfileEntry) {
+        const {range, hasVersion} = normalizePattern(req.pattern);
+
+        if (this.isLockfileEntryOutdated(lockfileEntry.version, range, hasVersion)) {
+          this.reporter.warn(this.reporter.lang('incorrectLockfileEntry', req.pattern));
+          this.removePattern(req.pattern);
+          this.lockfile.removePattern(req.pattern);
+          fresh = true;
+        }
+      } else {
+        fresh = true;
+      }
+
+      request.init();
+    }
+
+    await request.find({fresh, frozen: this.frozen});
+  }
+
+  /**
+   * TODO description
+   */
+
+  async init(
+    deps: DependencyRequestPatterns,
+    {isFlat, isFrozen, workspaceLayout}: ResolverOptions = {
+      isFlat: false,
+      isFrozen: false,
+      workspaceLayout: undefined,
+    },
+  ): Promise<void> {
+    this.flat = Boolean(isFlat);
+    this.frozen = Boolean(isFrozen);
+    this.workspaceLayout = workspaceLayout;
+    const activity = (this.activity = this.reporter.activity());
+
+    for (const req of deps) {
+      await this.find(req);
+    }
+
+    // all required package versions have been discovered, so now packages that
+    // resolved to existing versions can be resolved to their best available version
+    this.resolvePackagesWithExistingVersions();
+
+    for (const req of this.resolutionMap.delayQueue) {
+      this.resolveToResolution(req);
+    }
+
+    if (isFlat) {
+      for (const dep of deps) {
+        const name = normalizePattern(dep.pattern).name;
+        this.optimizeResolutions(name);
+      }
+    }
+
+    activity.end();
+    this.activity = null;
+  }
+
+  // for a given package, see if a single manifest can satisfy all ranges
+  optimizeResolutions(name: string) {
+    const patterns: Array<string> = this.dedupePatterns(this.patternsByPackage[name] || []);
+
+    // don't optimize things that already have a lockfile entry:
+    // https://github.com/yarnpkg/yarn/issues/79
+    const collapsablePatterns = patterns.filter(pattern => {
+      const remote = this.patterns[pattern]._remote;
+      return !this.lockfile.getLocked(pattern) && (!remote || remote.type !== 'workspace');
+    });
+    if (collapsablePatterns.length < 2) {
+      return;
+    }
+
+    // reverse sort, so we'll find the maximum satisfying version first
+    const availableVersions = this.getAllInfoForPatterns(collapsablePatterns).map(manifest => manifest.version);
+    availableVersions.sort(semver.rcompare);
+
+    const ranges = collapsablePatterns.map(pattern => normalizePattern(pattern).range);
+
+    // find the most recent version that satisfies all patterns (if one exists), and
+    // collapse to that version.
+    for (const version of availableVersions) {
+      if (ranges.every(range => semver.satisfies(version, range))) {
+        this.collapsePackageVersions(name, version, collapsablePatterns);
+        return;
+      }
+    }
+  }
+
+  /**
+    * Called by the package requester for packages that this resolver already had
+    * a matching version for. Delay the resolve, because better matches can still be
+    * discovered.
+    */
+
+  reportPackageWithExistingVersion(req: PackageRequest, info: Manifest) {
+    this.delayedResolveQueue.push({req, info});
+  }
+
+  /**
+    * Executes the resolve to existing versions for packages after the find process,
+    * when all versions that are going to be used have been discovered.
+    */
+
+  resolvePackagesWithExistingVersions() {
+    for (const {req, info} of this.delayedResolveQueue) {
+      req.resolveToExistingVersion(info);
+    }
+  }
+
+  resolveToResolution(req: DependencyRequestPattern): ?DependencyRequestPattern {
+    const {parentNames, pattern} = req;
+
+    if (!parentNames || this.flat) {
+      return req;
+    }
+
+    const resolution = this.resolutionMap.find(pattern, parentNames);
+
+    if (resolution) {
+      const resolutionManifest = this.getResolvedPattern(resolution);
+
+      if (resolutionManifest) {
+        invariant(resolutionManifest._reference, 'resolutions should have a resolved reference');
+        resolutionManifest._reference.patterns.push(pattern);
+        this.addPattern(pattern, resolutionManifest);
+        const lockManifest: ?LockManifest = this.lockfile.getLocked(pattern);
+        if (shouldUpdateLockfile(lockManifest, resolutionManifest._reference)) {
+          this.lockfile.removePattern(pattern);
+        }
+      } else {
+        this.resolutionMap.addToDelayQueue(req);
+      }
+      return null;
+    }
+
+    return req;
+  }
+}
